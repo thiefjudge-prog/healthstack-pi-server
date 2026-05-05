@@ -1,0 +1,4 @@
+.env.pi
+backend/.env
+*.env
+.env

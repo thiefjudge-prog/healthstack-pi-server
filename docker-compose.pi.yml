@@ -1,0 +1,201 @@
+# =============================================================================
+# HealthStack Pro — Raspberry Pi
+#
+# EXPOSE_MODE controls which tunnel/TLS service is active:
+#   quick      → Cloudflare Quick Tunnel (*.trycloudflare.com, no account needed)
+#   cloudflare → Cloudflare Named Tunnel (stable URL, needs CLOUDFLARE_TUNNEL_TOKEN)
+#   domain     → Custom domain + Let's Encrypt (needs DOMAIN set in .env.pi)
+#
+# Usage:
+#   cp templates/.env.pi.example ~/health-stack/.env.pi    # edit passwords + EXPOSE_MODE
+#   cp templates/backend.env.example ~/health-stack/backend/.env  # edit JWT keys etc.
+#   docker compose -f docker-compose.pi.yml \
+#     --env-file .env.pi \
+#     --profile ${EXPOSE_MODE} \
+#     up -d --build
+#
+# This file is managed by: https://github.com/thiefjudge-prog/healthstack-pi-server
+# scripts/03-deploy.sh copies it into ~/health-stack/ automatically.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 (ARM64 compatible) — tuned for 1 GB RAM
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: healthstack_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: healthstack
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    command: >
+      postgres
+        -c shared_buffers=128MB
+        -c max_connections=50
+        -c effective_cache_size=256MB
+        -c work_mem=4MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d healthstack"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - internal
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 (ARM64 compatible) — capped at 128 MB
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: healthstack_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD}
+        --appendonly yes
+        --maxmemory 128mb
+        --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  # ---------------------------------------------------------------------------
+  # FastAPI backend — built locally on the Pi
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: healthstack_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+    environment:
+      APP_ENV: production
+      DEBUG: "false"
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/healthstack
+      DATABASE_SYNC_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/healthstack
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    networks:
+      - internal
+
+  # ---------------------------------------------------------------------------
+  # Nginx — HTTP only for quick/cloudflare modes (Cloudflare handles TLS)
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: healthstack_nginx
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.cloudflare.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend:/usr/share/nginx/html/app:ro
+      - ./landing/dist:/usr/share/nginx/html/landing:ro
+    networks:
+      - internal
+      - external
+
+  # ---------------------------------------------------------------------------
+  # EXPOSE_MODE=quick — Cloudflare Quick Tunnel (no account, random URL)
+  # URL appears in container logs: docker logs healthstack_tunnel_quick
+  # ---------------------------------------------------------------------------
+  cloudflared-quick:
+    image: cloudflare/cloudflared:latest
+    container_name: healthstack_tunnel_quick
+    restart: unless-stopped
+    profiles: ["quick"]
+    command: tunnel --no-autoupdate --url http://nginx:80
+    depends_on:
+      - nginx
+    networks:
+      - external
+
+  # ---------------------------------------------------------------------------
+  # EXPOSE_MODE=cloudflare — Cloudflare Named Tunnel (stable URL)
+  # Requires CLOUDFLARE_TUNNEL_TOKEN in .env.pi
+  # Register at: https://one.dash.cloudflare.com → Zero Trust → Tunnels
+  # ---------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: healthstack_tunnel
+    restart: unless-stopped
+    profiles: ["cloudflare"]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - nginx
+    networks:
+      - external
+
+  # ---------------------------------------------------------------------------
+  # EXPOSE_MODE=domain — nginx with HTTPS + Let's Encrypt
+  # Replaces the plain nginx above; port 443 opened
+  # ---------------------------------------------------------------------------
+  nginx-ssl:
+    image: nginx:1.25-alpine
+    container_name: healthstack_nginx_ssl
+    restart: unless-stopped
+    profiles: ["domain"]
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.domain.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend:/usr/share/nginx/html/app:ro
+      - ./landing/dist:/usr/share/nginx/html/landing:ro
+      - certbot_www:/var/www/certbot:ro
+      - certbot_conf:/etc/letsencrypt:ro
+    networks:
+      - internal
+      - external
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: healthstack_certbot
+    profiles: ["domain"]
+    volumes:
+      - certbot_www:/var/www/certbot
+      - certbot_conf:/etc/letsencrypt
+    entrypoint: >
+      sh -c "trap exit TERM;
+             while :; do
+               certbot renew --webroot -w /var/www/certbot --quiet;
+               sleep 12h & wait $${!};
+             done"
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  external:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  certbot_www:
+  certbot_conf:
